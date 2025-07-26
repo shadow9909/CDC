@@ -1,0 +1,130 @@
+
+# ┌─────────────────┐    ┌──────────────┐    ┌─────────────┐    ┌──────────────┐
+# │   Source DB     │    │   Debezium   │    │    Kafka    │    │   Consumer   │
+# │                 │    │              │    │             │    │              │
+# │ wal_level=      │───▶│ Reads WAL    │───▶│ Topics:     │───▶│ Processes    │
+# │ logical         │    │ via logical  │    │ - users     │    │ & writes to  │
+# │                 │    │ replication  │    │ - orders    │    │ Target DB    │
+# └─────────────────┘    └──────────────┘    └─────────────┘    └──────────────┘
+#                                                    ▲
+#                                                    │
+#                                            ┌──────────────┐
+#                                            │  Zookeeper   │
+#                                            │ (Kafka mgmt) │
+#                                            └──────────────┘
+
+
+services:
+  # Source PostgreSQL Database
+  source-postgres:
+    image: postgres:13
+    container_name: source-postgres
+    environment:
+      POSTGRES_DB: source_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-scripts/source-db-init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: ["postgres", "-c", "wal_level=logical"]
+# The WAL level determines how much information Postgres writes to this log file.
+
+  # Target PostgreSQL Database
+  target-postgres:
+    image: postgres:13
+    container_name: target-postgres
+    environment:
+      POSTGRES_DB: target_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init-scripts/target-db-init.sql:/docker-entrypoint-initdb.d/init.sql
+
+
+# Zookeeper: Manages Kafka cluster metadata, leader election, configuration
+# Kafka: Message broker that stores and distributes change events
+  # Zookeeper
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      # Unique identifier for this Kafka broker in the cluster
+      # Since we have only 1 broker, we use ID = 1
+
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # How Kafka connects to Zookeeper
+      # "zookeeper" is the container name, 2181 is Zookeeper's port
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # Security protocol mapping for different listeners
+      # PLAINTEXT = no encryption (fine for development)
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      # How clients can reach Kafka
+      # kafka:29092    - for internal Docker network communication
+      # localhost:9092 - for external access from host machine
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # How many copies of consumer offset data to keep
+      # 1 = no replication (acceptable for development, use 3+ in production)
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+      # Automatically create topics when first message is sent
+      # Useful for development, typically disabled in production
+
+
+  # Debezium Connect
+  debezium:
+    image: debezium/connect:2.4
+    container_name: debezium
+    depends_on:
+      - kafka
+      - source-postgres
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      # Kafka brokers that Debezium connects to
+      # Uses internal Docker network address
+
+      GROUP_ID: 1
+      # Consumer group ID for Kafka Connect cluster
+      # All Connect workers with same group_id form a cluster
+
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      # Topic where connector configurations are stored
+      # Shared across all Connect workers in the cluster
+
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      # Topic where source offsets are stored
+      # Tracks where each connector left off reading
+
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      # Topic where connector status updates are stored
+      # Used for monitoring and coordination
+
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # How to serialize message keys and values
+      # JsonConverter = human-readable JSON format
+
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: false
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: false
+      # Whether to include schema information in messages
+      # false = cleaner JSON without schema metadata
